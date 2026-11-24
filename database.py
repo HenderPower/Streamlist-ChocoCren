@@ -50,7 +50,7 @@ def connection():
     finally:
         conn.close()
 
-def initialize_database() -> None:
+def initialize_database() -> None: # Rascunho do SQLLite
         with connection() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
@@ -140,7 +140,7 @@ def initialize_database() -> None:
             """
         )  
             
-def _next_code(conn: sqlite3.Connection, table: str, prefix: str) -> str:
+def _next_code(conn: sqlite3.Connection, table: str, prefix: str) -> str: # Criação do CRUD de Produtos
     row = conn.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table}").fetchone()
     return f"{prefix}-{int(row['next_id']):05d}"
 
@@ -256,3 +256,110 @@ def delete_product_if_unused(product_id: int) -> None:
             raise RuleError("Este produto possui histórico de pedidos. Use Inativar em vez de excluir.")
         conn.execute("DELETE FROM products WHERE id=?", (product_id,))
         conn.commit() 
+
+def list_motoboys(include_inactive: bool = True) -> list[dict]: # 
+    with connection() as conn:
+        sql = "SELECT * FROM motoboys"
+        if not include_inactive:
+            sql += " WHERE active=1"
+        sql += " ORDER BY name COLLATE NOCASE"
+        return [dict(row) for row in conn.execute(sql).fetchall()]
+
+
+def get_motoboy(motoboy_id: int) -> dict | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM motoboys WHERE id=?", (motoboy_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def create_motoboy(name: str, phone: str, plate: str, status: str, observations: str = "") -> str:
+    name, phone, plate = name.strip(), phone.strip(), plate.strip().upper()
+    if len(name) < 3 or len(name) > 120:
+        raise RuleError("Informe o nome completo do entregador (3 a 120 caracteres).")
+    if not re.fullmatch(r"\d{10,11}", phone):
+        raise RuleError("Telefone inválido. Informe DDD + número, somente dígitos (10 ou 11 números).")
+    if not re.fullmatch(r"[A-Z]{3}\d[A-Z0-9]\d{2}", plate):
+        raise RuleError("Placa inválida. Use o padrão ABC1234 ou ABC1D23.")
+    if status not in ("Disponível", "Indisponível"):
+        raise RuleError("O status inicial deve ser Disponível ou Indisponível.")
+    timestamp = now_iso()
+    try:
+        with connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            code = _next_code(conn, "motoboys", "MB")
+            conn.execute(
+                "INSERT INTO motoboys(code,name,phone,plate,status,active,observations,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?,?)",
+                (code, name, phone, plate, status, observations.strip(), timestamp, timestamp),
+            )
+            conn.commit()
+            return code
+    except sqlite3.IntegrityError as exc:
+        raise RuleError("Já existe um entregador com esse telefone ou placa.") from exc
+
+
+def update_motoboy(
+    motoboy_id: int, name: str, phone: str, plate: str, status: str, observations: str = ""
+) -> None:
+    name, phone, plate = name.strip(), phone.strip(), plate.strip().upper()
+    if len(name) < 3 or len(name) > 120:
+        raise RuleError("Informe o nome completo do entregador (3 a 120 caracteres).")
+    if not re.fullmatch(r"\d{10,11}", phone):
+        raise RuleError("Telefone inválido. Informe DDD + número, somente dígitos.")
+    if not re.fullmatch(r"[A-Z]{3}\d[A-Z0-9]\d{2}", plate):
+        raise RuleError("Placa inválida. Use o padrão ABC1234 ou ABC1D23.")
+    if status not in ("Disponível", "Indisponível", "Em Manutenção", "Em Entrega"):
+        raise RuleError("Status de entregador inválido.")
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute("SELECT status FROM motoboys WHERE id=?", (motoboy_id,)).fetchone()
+        if not current:
+            conn.rollback()
+            raise RuleError("Entregador não encontrado.")
+        active_route = conn.execute(
+            "SELECT 1 FROM orders WHERE motoboy_id=? AND status='Saiu para Entrega' LIMIT 1", (motoboy_id,)
+        ).fetchone()
+        if active_route and status != "Em Entrega":
+            conn.rollback()
+            raise RuleError("Este entregador possui uma entrega em rota. Finalize ou cancele o pedido antes de alterar o status.")
+        if current["status"] == "Em Entrega" and not active_route and status == "Em Entrega":
+            pass
+        try:
+            conn.execute(
+                "UPDATE motoboys SET name=?,phone=?,plate=?,status=?,observations=?,updated_at=? WHERE id=?",
+                (name, phone, plate, status, observations.strip(), now_iso(), motoboy_id),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            raise RuleError("Já existe outro entregador com esse telefone ou placa.") from exc
+
+
+def set_motoboy_active(motoboy_id: int, active: bool) -> None:
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active_route = conn.execute(
+            "SELECT 1 FROM orders WHERE motoboy_id=? AND status='Saiu para Entrega' LIMIT 1", (motoboy_id,)
+        ).fetchone()
+        if active_route and not active:
+            conn.rollback()
+            raise RuleError("Não é possível inativar um entregador com entrega em rota.")
+        conn.execute("UPDATE motoboys SET active=?,updated_at=? WHERE id=?", (int(active), now_iso(), motoboy_id))
+        conn.commit()
+
+
+def delete_motoboy_if_unused(motoboy_id: int) -> None:
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        history = conn.execute("SELECT 1 FROM orders WHERE motoboy_id=? LIMIT 1", (motoboy_id,)).fetchone()
+        if history:
+            conn.rollback()
+            raise RuleError("Este entregador possui histórico de pedidos. Use Inativar em vez de excluir.")
+        conn.execute("DELETE FROM motoboys WHERE id=?", (motoboy_id,))
+        conn.commit()
+
+
+def available_motoboys() -> list[dict]:
+    with connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM motoboys WHERE active=1 AND status='Disponível' ORDER BY name COLLATE NOCASE"
+        ).fetchall()]
