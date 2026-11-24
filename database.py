@@ -139,3 +139,120 @@ def initialize_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements(product_id);
             """
         )  
+            
+def _next_code(conn: sqlite3.Connection, table: str, prefix: str) -> str:
+    row = conn.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table}").fetchone()
+    return f"{prefix}-{int(row['next_id']):05d}"
+
+
+def _validate_product_fields(
+    name: str, category: str, flavor: str, size: str, price_cents: int, stock: int, min_stock: int
+) -> None:
+    if len(name.strip()) < 2 or len(name.strip()) > 120:
+        raise RuleError("O nome do produto deve ter entre 2 e 120 caracteres.")
+    if category not in PRODUCT_CATEGORIES:
+        raise RuleError("Selecione uma categoria válida: Trufa, Barra ou Ovo de Páscoa.")
+    if not flavor.strip() or len(flavor.strip()) > 60:
+        raise RuleError("Informe um sabor com até 60 caracteres.")
+    size_value = size.strip()
+    if len(size_value) > 20 or not re.fullmatch(r"\d+(?:[.,]\d+)?\s?(?:g|kg)", size_value, flags=re.IGNORECASE):
+        raise RuleError("Informe um peso válido em gramas ou quilogramas (ex.: 100g ou 1kg).")
+    if Decimal(re.match(r"\d+(?:[.,]\d+)?", size_value).group(0).replace(",", ".")) <= 0:
+        raise RuleError("O peso do produto deve ser maior que zero.")
+    if price_cents <= 0:
+        raise RuleError("O preço unitário deve ser maior que zero.")
+    if not 0 <= stock <= 1_000_000:
+        raise RuleError("O estoque deve estar entre 0 e 1.000.000 unidades.")
+    if not 0 <= min_stock <= 1_000_000:
+        raise RuleError("O estoque mínimo deve estar entre 0 e 1.000.000 unidades.")
+
+
+def list_products(include_inactive: bool = True) -> list[dict]:
+    with connection() as conn:
+        sql = "SELECT * FROM products"
+        if not include_inactive:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY category, flavor, size"
+        return [dict(row) for row in conn.execute(sql).fetchall()]
+
+
+def get_product(product_id: int) -> dict | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def create_product(
+    name: str, category: str, flavor: str, size: str, price_cents: int, stock: int,
+    min_stock: int = DEFAULT_MIN_STOCK,
+) -> str:
+    _validate_product_fields(name, category, flavor, size, price_cents, stock, min_stock)
+    timestamp = now_iso()
+    try:
+        with connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            code = _next_code(conn, "products", "CH")
+            cur = conn.execute(
+                """INSERT INTO products
+                (sku,name,category,flavor,size,category_key,flavor_key,size_key,price_cents,stock,min_stock,active,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
+                (code, name.strip(), category, flavor.strip(), size.strip(), normalize_key(category),
+                 normalize_key(flavor), normalize_key(size), price_cents, stock, min_stock, timestamp, timestamp),
+            )
+            product_id = int(cur.lastrowid)
+            if stock:
+                conn.execute(
+                    "INSERT INTO stock_movements(product_id,movement_type,quantity_change,note,created_at) VALUES(?,?,?,?,?)",
+                    (product_id, "ESTOQUE_INICIAL", stock, "Saldo informado no cadastro", timestamp),
+                )
+            conn.commit()
+            return code
+    except sqlite3.IntegrityError as exc:
+        if "products.category_key" in str(exc) or "UNIQUE constraint failed: products.category_key" in str(exc):
+            raise RuleError("Já existe um produto com essa combinação de tipo, sabor e peso.") from exc
+        raise RuleError("Não foi possível cadastrar: já existe um SKU ou variação igual.") from exc
+
+
+def update_product(
+    product_id: int, name: str, category: str, flavor: str, size: str, price_cents: int,
+    new_stock: int, min_stock: int,
+) -> None:
+    _validate_product_fields(name, category, flavor, size, price_cents, new_stock, min_stock)
+    timestamp = now_iso()
+    try:
+        with connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute("SELECT stock FROM products WHERE id=?", (product_id,)).fetchone()
+            if not old:
+                raise RuleError("Produto não encontrado.")
+            delta = int(new_stock) - int(old["stock"])
+            conn.execute(
+                """UPDATE products SET name=?,category=?,flavor=?,size=?,category_key=?,flavor_key=?,size_key=?,
+                price_cents=?,stock=?,min_stock=?,updated_at=? WHERE id=?""",
+                (name.strip(), category, flavor.strip(), size.strip(), normalize_key(category), normalize_key(flavor),
+                 normalize_key(size), price_cents, new_stock, min_stock, timestamp, product_id),
+            )
+            if delta:
+                conn.execute(
+                    "INSERT INTO stock_movements(product_id,movement_type,quantity_change,note,created_at) VALUES(?,?,?,?,?)",
+                    (product_id, "AJUSTE", delta, "Ajuste manual de estoque no cadastro do produto", timestamp),
+                )
+            conn.commit()
+    except sqlite3.IntegrityError as exc:
+        raise RuleError("Essa combinação de tipo, sabor e peso já está cadastrada em outro produto.") from exc
+
+
+def set_product_active(product_id: int, active: bool) -> None:
+    with connection() as conn:
+        conn.execute("UPDATE products SET active=?,updated_at=? WHERE id=?", (int(active), now_iso(), product_id))
+
+
+def delete_product_if_unused(product_id: int) -> None:
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        history = conn.execute("SELECT 1 FROM order_items WHERE product_id=? LIMIT 1", (product_id,)).fetchone()
+        if history:
+            conn.rollback()
+            raise RuleError("Este produto possui histórico de pedidos. Use Inativar em vez de excluir.")
+        conn.execute("DELETE FROM products WHERE id=?", (product_id,))
+        conn.commit() 
