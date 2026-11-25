@@ -16,6 +16,7 @@ ORDER_STATUSES = ("Em Preparo", "Saiu para Entrega", "Entregue", "Cancelado")
 COURIER_STATUSES = ("Disponível", "Em Entrega", "Indisponível", "Em Manutenção")
 DEFAULT_MIN_STOCK = 5
 
+
 class RuleError(ValueError):
     pass
 
@@ -50,12 +51,13 @@ def connection():
     finally:
         conn.close()
 
-def initialize_database() -> None: # Rascunho do SQLLite
-        with connection() as conn:
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA synchronous = NORMAL")
-            conn.executescript(
-        """
+
+def initialize_database() -> None:
+    with connection() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sku TEXT NOT NULL UNIQUE,
@@ -138,9 +140,10 @@ def initialize_database() -> None: # Rascunho do SQLLite
             CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
             CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements(product_id);
             """
-        )  
-            
-def _next_code(conn: sqlite3.Connection, table: str, prefix: str) -> str: # Criação do CRUD de Produtos
+        )
+
+
+def _next_code(conn: sqlite3.Connection, table: str, prefix: str) -> str:
     row = conn.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table}").fetchone()
     return f"{prefix}-{int(row['next_id']):05d}"
 
@@ -255,9 +258,10 @@ def delete_product_if_unused(product_id: int) -> None:
             conn.rollback()
             raise RuleError("Este produto possui histórico de pedidos. Use Inativar em vez de excluir.")
         conn.execute("DELETE FROM products WHERE id=?", (product_id,))
-        conn.commit() 
+        conn.commit()
 
-def list_motoboys(include_inactive: bool = True) -> list[dict]: # 
+
+def list_motoboys(include_inactive: bool = True) -> list[dict]:
     with connection() as conn:
         sql = "SELECT * FROM motoboys"
         if not include_inactive:
@@ -479,7 +483,8 @@ def get_order(order_id: int) -> dict | None:
         result = dict(order)
         result["items"] = [dict(r) for r in conn.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,)).fetchall()]
         return result
-    
+
+
 def assign_order_to_motoboy(order_id: int, motoboy_id: int) -> None:
     timestamp = now_iso()
     with connection() as conn:
@@ -605,5 +610,3 @@ def product_has_order_history(product_id: int) -> bool:
 def motoboy_has_order_history(motoboy_id: int) -> bool:
     with connection() as conn:
         return conn.execute("SELECT 1 FROM orders WHERE motoboy_id=? LIMIT 1", (motoboy_id,)).fetchone() is not None
-    
-
