@@ -479,3 +479,73 @@ def get_order(order_id: int) -> dict | None:
         result = dict(order)
         result["items"] = [dict(r) for r in conn.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,)).fetchall()]
         return result
+    
+def assign_order_to_motoboy(order_id: int, motoboy_id: int) -> None:
+    timestamp = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()
+        courier = conn.execute("SELECT status,active FROM motoboys WHERE id=?", (motoboy_id,)).fetchone()
+        if not order or order["status"] != "Em Preparo":
+            conn.rollback()
+            raise RuleError("Somente pedidos Em Preparo podem ser despachados.")
+        if not courier or not courier["active"] or courier["status"] != "Disponível":
+            conn.rollback()
+            raise RuleError("O entregador selecionado não está disponível.")
+        conn.execute("UPDATE orders SET status='Saiu para Entrega',motoboy_id=?,updated_at=? WHERE id=?", (motoboy_id, timestamp, order_id))
+        conn.execute("UPDATE motoboys SET status='Em Entrega',updated_at=? WHERE id=?", (timestamp, motoboy_id))
+        conn.commit()
+
+
+def complete_delivery(order_id: int) -> None:
+    timestamp = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute("SELECT status,motoboy_id FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not order or order["status"] != "Saiu para Entrega":
+            conn.rollback()
+            raise RuleError("Somente pedidos que saíram para entrega podem ser concluídos.")
+        conn.execute("UPDATE orders SET status='Entregue',delivered_at=?,updated_at=? WHERE id=?", (timestamp, timestamp, order_id))
+        if order["motoboy_id"] is not None:
+            other = conn.execute(
+                "SELECT 1 FROM orders WHERE motoboy_id=? AND status='Saiu para Entrega' AND id<>? LIMIT 1",
+                (order["motoboy_id"], order_id),
+            ).fetchone()
+            if not other:
+                conn.execute("UPDATE motoboys SET status='Disponível',updated_at=? WHERE id=? AND active=1", (timestamp, order["motoboy_id"]))
+        conn.commit()
+
+
+def cancel_order(order_id: int, reason: str) -> None:
+    reason = reason.strip()
+    if len(reason) < 5 or len(reason) > 500:
+        raise RuleError("Descreva o motivo do cancelamento (5 a 500 caracteres).")
+    timestamp = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute("SELECT status,motoboy_id,code FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not order or order["status"] not in ("Em Preparo", "Saiu para Entrega"):
+            conn.rollback()
+            raise RuleError("Este pedido não pode mais ser cancelado. Pedidos Entregues ou já Cancelados não permitem estorno.")
+        items = conn.execute("SELECT product_id,quantity FROM order_items WHERE order_id=?", (order_id,)).fetchall()
+        for item in items:
+            conn.execute("UPDATE products SET stock=stock+?,updated_at=? WHERE id=?", (item["quantity"], timestamp, item["product_id"]))
+            conn.execute(
+                "INSERT INTO stock_movements(product_id,movement_type,quantity_change,note,order_id,created_at) VALUES(?,?,?,?,?,?)",
+                (item["product_id"], "ESTORNO_CANCELAMENTO", item["quantity"], f"Estorno do pedido {order['code']}", order_id, timestamp),
+            )
+        conn.execute(
+            "UPDATE orders SET status='Cancelado',cancellation_reason=?,updated_at=? WHERE id=?",
+            (reason, timestamp, order_id),
+        )
+        if order["motoboy_id"] is not None:
+            other = conn.execute(
+                "SELECT 1 FROM orders WHERE motoboy_id=? AND status='Saiu para Entrega' AND id<>? LIMIT 1",
+                (order["motoboy_id"], order_id),
+            ).fetchone()
+            if not other:
+                conn.execute(
+                    "UPDATE motoboys SET status='Disponível',updated_at=? WHERE id=? AND active=1 AND status='Em Entrega'",
+                    (timestamp, order["motoboy_id"]),
+                )
+        conn.commit()
