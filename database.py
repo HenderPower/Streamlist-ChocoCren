@@ -363,3 +363,119 @@ def available_motoboys() -> list[dict]:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM motoboys WHERE active=1 AND status='Disponível' ORDER BY name COLLATE NOCASE"
         ).fetchall()]
+
+
+def create_order(
+    customer_name: str,
+    customer_phone: str,
+    delivery_address: str,
+    items: Iterable[tuple[int, int]],
+    discount_percent: Decimal,
+    delivery_fee_cents: int,
+    service_fee_cents: int,
+) -> str:
+    customer_name = customer_name.strip()
+    customer_phone = customer_phone.strip()
+    delivery_address = delivery_address.strip()
+    if len(customer_name) < 2 or len(customer_name) > 120:
+        raise RuleError("Informe o nome do cliente (2 a 120 caracteres).")
+    if not re.fullmatch(r"\d{10,11}", customer_phone):
+        raise RuleError("Telefone inválido. Informe DDD + número, somente dígitos (10 ou 11 números).")
+    if len(delivery_address) < 8 or len(delivery_address) > 250:
+        raise RuleError("Informe um endereço de entrega completo (8 a 250 caracteres).")
+    if not Decimal("0") <= discount_percent <= Decimal("100"):
+        raise RuleError("O desconto deve estar entre 0% e 100%.")
+    if delivery_fee_cents < 0 or service_fee_cents < 0:
+        raise RuleError("Taxas não podem ter valores negativos.")
+
+    quantities: dict[int, int] = {}
+    for product_id, quantity in items:
+        product_id, quantity = int(product_id), int(quantity)
+        if quantity <= 0 or quantity > 1_000:
+            raise RuleError("A quantidade de cada produto deve ser de 1 a 1.000 unidades.")
+        quantities[product_id] = quantities.get(product_id, 0) + quantity
+    if not quantities:
+        raise RuleError("Adicione pelo menos um produto ao pedido.")
+
+    timestamp = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        product_rows = {}
+        subtotal = 0
+        for product_id, quantity in quantities.items():
+            row = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+            if not row or not row["active"]:
+                conn.rollback()
+                raise RuleError("Um dos produtos do carrinho foi inativado. Atualize o carrinho e tente novamente.")
+            if row["stock"] < quantity:
+                conn.rollback()
+                raise RuleError(f"Estoque insuficiente para {row['name']}. Disponível: {row['stock']}; solicitado: {quantity}.")
+            product_rows[product_id] = row
+            subtotal += int(row["price_cents"]) * quantity
+
+        discount_cents = int(
+            (Decimal(subtotal) * discount_percent / Decimal(100)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+        total = subtotal - discount_cents + delivery_fee_cents + service_fee_cents
+        next_id = int(conn.execute("SELECT COALESCE(MAX(id),0)+1 FROM orders").fetchone()[0])
+        order_code = f"#{next_id:05d}"
+        cur = conn.execute(
+            """INSERT INTO orders(code,customer_name,customer_phone,delivery_address,status,subtotal_cents,
+            discount_percent,discount_cents,delivery_fee_cents,service_fee_cents,total_cents,created_at,updated_at)
+            VALUES(?,?,?,?,'Em Preparo',?,?,?,?,?,?,?,?)""",
+            (order_code, customer_name, customer_phone, delivery_address, subtotal, str(discount_percent),
+             discount_cents, delivery_fee_cents, service_fee_cents, total, timestamp, timestamp),
+        )
+        order_id = int(cur.lastrowid)
+        for product_id, quantity in quantities.items():
+            product = product_rows[product_id]
+            updated = conn.execute(
+                "UPDATE products SET stock=stock-?,updated_at=? WHERE id=? AND active=1 AND stock>=?",
+                (quantity, timestamp, product_id, quantity),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                raise RuleError(f"O estoque de {product['name']} mudou. Atualize o pedido e tente novamente.")
+            line_total = int(product["price_cents"]) * quantity
+            conn.execute(
+                """INSERT INTO order_items(order_id,product_id,product_name,category,flavor,size,quantity,unit_price_cents,subtotal_cents)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (order_id, product_id, product["name"], product["category"], product["flavor"], product["size"],
+                 quantity, product["price_cents"], line_total),
+            )
+            conn.execute(
+                "INSERT INTO stock_movements(product_id,movement_type,quantity_change,note,order_id,created_at) VALUES(?,?,?,?,?,?)",
+                (product_id, "SAIDA_VENDA", -quantity, f"Baixa pelo pedido {order_code}", order_id, timestamp),
+            )
+        conn.commit()
+        return order_code
+
+
+def list_orders(status: str = "Todos", search: str = "", limit: int = 200) -> list[dict]:
+    sql = """SELECT o.*, m.name AS motoboy_name, m.code AS motoboy_code
+             FROM orders o LEFT JOIN motoboys m ON m.id=o.motoboy_id WHERE 1=1"""
+    params: list = []
+    if status != "Todos":
+        sql += " AND o.status=?"
+        params.append(status)
+    if search.strip():
+        term = f"%{search.strip()}%"
+        sql += " AND (o.code LIKE ? OR o.customer_name LIKE ? OR EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id=o.id AND oi.product_name LIKE ?))"
+        params.extend((term, term, term))
+    sql += " ORDER BY o.id DESC LIMIT ?"
+    params.append(int(limit))
+    with connection() as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def get_order(order_id: int) -> dict | None:
+    with connection() as conn:
+        order = conn.execute(
+            "SELECT o.*,m.name AS motoboy_name,m.code AS motoboy_code FROM orders o LEFT JOIN motoboys m ON m.id=o.motoboy_id WHERE o.id=?",
+            (order_id,),
+        ).fetchone()
+        if not order:
+            return None
+        result = dict(order)
+        result["items"] = [dict(r) for r in conn.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,)).fetchall()]
+        return result
