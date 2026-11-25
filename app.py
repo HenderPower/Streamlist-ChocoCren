@@ -233,3 +233,49 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+def brl(cents: int) -> str:
+    value = Decimal(int(cents)) / Decimal(100)
+    return "R$ " + f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def phone_digits(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    if digits.startswith("55") and len(digits) in (12, 13):
+        digits = digits[2:]
+    return digits
+
+
+def parse_percent(value: float) -> Decimal:
+    try:
+        result = Decimal(str(value)).quantize(Decimal("0.01"))
+    except InvalidOperation as exc:
+        raise db.RuleError("Percentual de desconto inválido.") from exc
+    if not Decimal("0") <= result <= Decimal("100"):
+        raise db.RuleError("O desconto deve estar entre 0% e 100%.")
+    return result
+
+
+def show_error(action):
+    try:
+        action()
+    except db.RuleError as exc:
+        st.error(str(exc))
+    except Exception as exc:
+        st.error("Ocorreu um erro inesperado ao salvar. Confira os dados e tente novamente.")
+        print(f"Erro não tratado no ChocoCren: {type(exc).__name__}: {exc}")
+
+
+def page_header(title: str, description: str, icon: str):
+    st.markdown(f"## {icon}  {title}")
+    st.markdown(f'<div class="cc-subtitle">{description}</div>', unsafe_allow_html=True)
+
+
+def status_text(product: dict) -> str:
+    if not product["active"]:
+        return "Inativo"
+    if product["stock"] == 0:
+        return "Sem Estoque"
+    if product["stock"] < product["min_stock"]:
+        return "Estoque Baixo"
+    return "Disponível"
