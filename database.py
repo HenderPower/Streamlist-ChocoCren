@@ -607,4 +607,3 @@ def motoboy_has_order_history(motoboy_id: int) -> bool:
         return conn.execute("SELECT 1 FROM orders WHERE motoboy_id=? LIMIT 1", (motoboy_id,)).fetchone() is not None
     
 
-    
