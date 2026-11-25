@@ -549,3 +549,62 @@ def cancel_order(order_id: int, reason: str) -> None:
                     (timestamp, order["motoboy_id"]),
                 )
         conn.commit()
+
+
+def dashboard_metrics() -> dict:
+    with connection() as conn:
+        def scalar(sql: str, params: tuple = ()) -> int:
+            return int(conn.execute(sql, params).fetchone()[0] or 0)
+        return {
+            "orders_preparing": scalar("SELECT COUNT(*) FROM orders WHERE status='Em Preparo'"),
+            "orders_route": scalar("SELECT COUNT(*) FROM orders WHERE status='Saiu para Entrega'"),
+            "couriers_available": scalar("SELECT COUNT(*) FROM motoboys WHERE active=1 AND status='Disponível'"),
+            "products_low": scalar("SELECT COUNT(*) FROM products WHERE active=1 AND stock<min_stock"),
+            "products_total": scalar("SELECT COUNT(*) FROM products WHERE active=1"),
+            "couriers_total": scalar("SELECT COUNT(*) FROM motoboys WHERE active=1"),
+        }
+
+
+def low_stock_products() -> list[dict]:
+    with connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM products WHERE active=1 AND stock<min_stock ORDER BY stock ASC, name COLLATE NOCASE"
+        ).fetchall()]
+
+
+def monthly_order_summary(month_count: int = 11) -> list[dict]:
+    now = datetime.now()
+    months = []
+    year, month = now.year, now.month
+    for _ in range(month_count - 1, -1, -1):
+        y, m = year, month - _
+        while m <= 0:
+            m += 12
+            y -= 1
+        months.append((f"{y:04d}-{m:02d}", f"{m:02d}/{str(y)[-2:]}"))
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT substr(created_at,1,7) AS ym, SUM(total_cents) AS total FROM orders WHERE status<>'Cancelado' GROUP BY substr(created_at,1,7)"
+        ).fetchall()
+    values = {r["ym"]: int(r["total"] or 0) for r in rows}
+    return [{"Mês": label, "Valor dos pedidos (R$)": round(values.get(key, 0) / 100, 2)} for key, label in months]
+
+
+def get_stock_movements(product_id: int, limit: int = 30) -> list[dict]:
+    with connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM stock_movements WHERE product_id=? ORDER BY id DESC LIMIT ?", (product_id, limit)
+        ).fetchall()]
+
+
+def product_has_order_history(product_id: int) -> bool:
+    with connection() as conn:
+        return conn.execute("SELECT 1 FROM order_items WHERE product_id=? LIMIT 1", (product_id,)).fetchone() is not None
+
+
+def motoboy_has_order_history(motoboy_id: int) -> bool:
+    with connection() as conn:
+        return conn.execute("SELECT 1 FROM orders WHERE motoboy_id=? LIMIT 1", (motoboy_id,)).fetchone() is not None
+    
+
+    
